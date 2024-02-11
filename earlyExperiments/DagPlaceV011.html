@@ -1,0 +1,1076 @@
+<!DOCTYPE html>
+<html><head>
+<meta charset="UTF-8" /> 
+<script>
+
+//Canvas and ByteRect code are opensource MIT licensed
+//(parts from benrayfield's various other projects including https://jsfiddle.net/q687fcrk/1/ and
+//https://github.com/benrayfield/smartblob/blob/master/data/smartblob/WebcamSeesBendableLoopAsGameControllerAjaxToServer.html )
+
+//byte offsets for ByteRect, canvas, etc, in js.
+const RED = 0, GREEN = 1, BLUE = 2, ALPHA = 3;
+var colorDimRed = RED;
+var colorDimGreen = GREEN;
+var colorDimBlue = BLUE;
+var colorDimAlpha = ALPHA;
+
+const COLORS = 14;
+const TRANSPARENT = COLORS;
+const FORK = COLORS+1;
+
+//view/edit range for y and x is 0 to 2**14-1, and leave some room for viewing past this top left corner.
+//As of 2024-2-10 the canvas is 256x256 so go with that for now.
+//var viewY = 2000;
+//var viewX = 2000;
+var viewY = 8192; //FIXME sync this with the 2 input type=number
+var viewX = 8192;
+
+//a 2d block of voxel sum groups. Each voxel sum group has 14 (FIXME 16?) doubles. Example: 128x128x14 doubles.
+//
+//
+//For the r/place-like opensource peer to peer webpages, im trying 16384x16384 pixels (256 megapixel video),
+//as 128x128 lazy-evaled blocks of 128x128 pixels each. Each pixel has 14 sums, one per possible color.
+//So a sparse float64[4billion] up to 32gB. Up to 2 million users.
+//The limit of 2 (or maybe 4?) million users is so when max_int (2**31-1) is 
+//used as 1.0 for the length at most 1.0 vector of each user (that they paint to edit), even if every user paints
+//that same pixel as strongly as they can, it still wont overflow the float64 to have roundoff.
+//For the r/place-like opensource peer to peer webpages, I wont be able to censor what people paint and share since
+//they will paint by digital signatures of an ed25519 key pair they create automatically in their browser with a
+//password, and I dont have their password.
+var Block = function(){
+	//this.colorSums = new Float64Array(128*128*14);
+	this.colorSums = new Float64Array(128*128*16);
+};
+
+var blocks = []; //sparse 128x128 each either null or a Block of 128x128x16 (or x14?) doubles, so together thats 2**32 sparse doubles.
+for(let b=0; b<128*128; b++) blocks.push(null); //sparse
+
+let intToBlockIndex = function(intAddr){
+	return intAddr>>>18;
+};
+
+let blockIndexToBlock = function(blockIndex){
+	return blocks[blockIndex] || (blocks[blockIndex] = new Block());
+};
+
+let intToBlock = function(intAddr){
+	//return blockIndexToBlock(intToBlockIndex(intAddr));
+	let blockIndex = intAddr>>>18;
+	return blocks[blockIndex] || (blocks[blockIndex] = new Block());
+};
+
+let intToInsideBlock = function(intAddr){
+	return intAddr&0x3ffff;
+};
+
+//read double at sparse uint32 index.
+let D = function(intAddr){
+	return (blocks[intAddr>>>18] || (blocks[intAddr>>>18] = new Block())).colorSums[intAddr&0x3ffff];
+};
+
+//modify by +=, double at sparse uint32 index.
+let DPlusEq = function(intAddr, add){
+	return (blocks[intAddr>>>18] || (blocks[intAddr>>>18] = new Block())).colorSums[intAddr&0x3ffff] += add;
+};
+
+//set double at sparse uint32 index.
+let DEq = function(intAddr, newVal){
+	return (blocks[intAddr>>>18] || (blocks[intAddr>>>18] = new Block())).colorSums[intAddr&0x3ffff] = newVal;
+};
+
+let DExists = function(intAddr){
+	return !!blocks[intAddr>>>18];
+};
+
+//a yxc int to y. y7 x7 y7 x7 c4
+var intToY = function(intAddr){
+	//wrong cuz its split 2 levels: return intAddr>>>18;
+	return ((intAddr>>>18)&0b11111110000000)|((intAddr>>>11)&0x7f);
+};
+
+//a yxc int to x. y7 x7 y7 x7 c4
+var intToX = function(intAddr){
+	//wrong cuz its split 2 levels: return (intAddr>>>4)&0x3fff;
+	return ((intAddr>>>11)&0b11111110000000)|((intAddr>>>4)&0x7f);
+};
+
+//a yxc int to colorIndex (0 to 15, aligns to QVColors though that doesnt contain the last one: FORK and maybe not the second last one: TRANSPARENT)
+var intToC = function(intAddr){
+	return intAddr&0xf;
+};
+
+//get high 7 bits of 14 bit y or x.
+var high7 = function(yOrX){
+	return (yOrX>>>7)&0x7f;
+};
+
+//get low 7 bits of 14 bit y or x.
+var low7 = function(yOrX){
+	return yOrX&0x7f;
+};
+
+//y and x range 0 to 2**14-1. color ranges 0 to 15. y7 x7 y7 x7 c4.
+let yxcToInt = function(y,x,color){
+	//wrong cuz its split 2 levels: return (y<<18)|(x<<4)|color;
+	//return ((y&0b11111110000000)<<18)|()
+	return (high7(y)<<25)|(high7(x)<<18)|(low7(y)<<11)|(low7(x)<<4)|(color&0xf);
+};
+
+//read double at y and x and color. creates Block if not exist.
+let yxc = function(y, x, color){
+	return D(yxcToInt(y,x,color));
+};
+
+//write double at y and x and color. creates Block if not exist.
+let yxcEq = function(y, x, color, newVal){
+	DEq(yxcToInt(y,x,color),newVal);
+};
+
+//does += double at y and x and color. creates Block if not exist.
+let yxcPlusEq = function(y, x, color, add){
+	return DPlusEq(yxcToInt(y,x,color),add);
+};
+
+let testAddressYXC = function(y,x,c){
+	let addr = yxcToInt(y,x,c);
+	let rebuiltY = intToY(addr);
+	let rebuiltX = intToX(addr);
+	let rebuiltC = intToC(addr);
+	if(rebuiltY != y || rebuiltX != x || rebuiltC != c){
+		throw new Error('y='+y+' rebuiltY='+rebuiltY+' x='+x+' rebuiltX='+rebuiltX+' c='+c+' rebuiltC='+rebuiltC+' addr='+addr);
+	}
+};
+let countYxcTests = 0;
+for(let y=0; y<1000; y+=119){
+	for(let x=5; x<1000; x+=77){
+		for(let c=0; c<16; c++){
+			testAddressYXC(y,x,c);
+			countYxcTests++;
+		}
+	}
+}
+console.log('Passed '+countYxcTests+' testAddressYXC tests');
+
+Block.prototype.addSparsePic = function(sparsePic, add, optionalIndex){
+	/*let i = optionalIndex || 0;
+	let color = sparsePic[i++];
+	if(color == FORK){
+		for(let c=0; c<4; c++){
+			i = this.childs(c).addSparsePic(sparsePic, add, i);
+		}
+	}else if(color != TRANSPARENT){ //do nothing if transparent. else...
+		this.colorSums[color] += add; //caller should make sure this never overflows plus/minus 2**53 cuz float64 does exact integers in that range.
+	}
+	return i;
+	*/
+	throw new Error('TODO do everything at leaf level even if sparsePic ends at a bigger than 1x1x17 powOf2 size square.');
+};
+
+var QuadtreeVoxel = function(){
+
+	//this.childs = []; //FIXME should be either 0 or 4 childs as its a quadtree
+	this.childs = null; //FIXME should be either 0 or 4 childs as its a quadtree. [4 childs] or null? instead of null should it be []?
+
+	//TODO when painting (in colorIntAtYX for example), sum all log number of QuadtreeVoxel.colorSums[i] along
+	//path to the leaf QuadtreeVoxel so dagball_bloomtree-like data structure (which QuadtreeVoxel is similar to
+	//but in js object form, not tight 2 bits per tree node form)... when painting like that, take max of those 14
+	//sums of log number of int54s to decide on which of 14 int32s (colorARGB or something like that) to return for a y x.
+	this.colorSums = new Float64Array(COLORS); //1 int54 for each of 14 possible colors per pixel. Each user adds
+
+
+	//either 0 or plus/minus Math.floor(something about inverse square root of number of pixels that user has painted
+	//(any of 14 colors each) and all their pixels scaled by inverse square root of number of pixels they painted and
+	//have not unpainted yet). TODO.
+	this.colorInt = 0xff2288bb; //FIXME choose what default color?
+	//TODO? this.uint4 = //a uint4 from 0 to COLORS-1. If childs exist, this is FORK, else its 1 of the nontransparent colors.
+};
+
+//creates child if not exist (all 4 childs). index must be 0 1 2 or 3.
+QuadtreeVoxel.prototype.child = function(index){
+	if(!this.childs){
+		this.childs = [];
+		for(let i=0; i<4; i++){
+			this.childs.push(new QuadtreeVoxel());
+		}
+	}
+	return this.childs[index];
+};
+
+//a sparse pic is a Uint4Array where value 0xf/FORK means recurse 4 childs, and the other 15 uint4 values are leafs (do nothing if its TRANSPARENT).
+//optionalIndex is from 0 to sparsePic.length-1. Adds the param 'add' into 1 of the colors, recursively.
+//returns the index just past (excl) the end of the sparsePic, depending on its recursion of FORK vs nonFORKs/leafs.
+QuadtreeVoxel.prototype.addSparsePic = function(sparsePic, add, optionalIndex){
+	let i = optionalIndex || 0;
+	let color = sparsePic[i++];
+	if(color == FORK){
+		for(let c=0; c<4; c++){
+			i = this.childs(c).addSparsePic(sparsePic, add, i);
+		}
+	}else if(color != TRANSPARENT){ //do nothing if transparent. else...
+		this.colorSums[color] += add; //caller should make sure this never overflows plus/minus 2**53 cuz float64 does exact integers in that range.
+	}
+	return i;
+};
+
+//each player signs [time,vectorAtMostLength1] so sqrt of sum of squared positions must be at most that.
+var intToUseAsOne = 0x7fffffff; //maxint. Can add about 2**21 of these before it would exceed the int54 precision of float64.
+
+//size in pixels, even if stored sparsely at different powOf2Size squares as usual in sparsePic. Rounds intToUseAsOne/sqrt(size) down.
+//Use what this returns as the 'add' param in QuadtreeVoxel.prototype.addSparsePic.
+var positionMul = function(size){
+	return (intToUseAsOne/Math.sqrt(size))|0;
+};
+
+//sparsePic is a Uint4Array. Returns the surface area at at depth. TODO throws if the pic goes deeper than that.
+//depth 0 is just the top QuadtreeVoxel aka the uint4 at sparsPic[0]. Depth 1 is its 4 childs. Depth 2 is their 4 childs, and so on.
+var sparsePicSizeAtDepth = function(sparsePic, depth){
+	throw new Error('TODO');
+};
+
+/*TODO each ed25519 pubkey must come specify the max depth, and max data size in units of uint4s, that it can sign.
+or maybe exclude max depth from that.
+
+TODO should sigs each come with [time,sparseVec,otherSig] where otherSig is just the [pubkeyB,sig,time,sparseVec]
+of some other pubkeyB (not selfs pubkey) so in each communication you normally choose a random sig that youre also displaying
+from other players (in the massively multiplayer paint opensource peer to peer app) to recommend and share it to others
+that they might want to subscribe to it, and other players might include things you sign similarly.
+The max size of that can be at most maybe 2x the max size allowed by this pubkey "max data size in units of uint4s, that it can sign",
+or that be a sum of them or something like that. Might need to split this into a few different things signed but
+still make sure to copy that other [pubkeyB,sig,time,sparseVec] also instead of just referring to it by hash.
+Or maybe should refer to 2 or 3 others at once, some of which are in your own history and some of which are other players in the app.
+Maybe the number of other sigs included should be specified in the pubkey itself, as in concatting that to the pubkeys base64.
+*/
+
+var QVColors = Int32Array.of( //GPT4 suggested these 14 colors 2024-2-9 which I copied the html gpt made to display it to https://jsfiddle.net/jLdcxvag/
+	0x808080, // Gray
+	0x000000, // Black
+	0xFFFFFF, // White
+	0xFF0000, // Red
+	0x00FF00, // Green
+	0x0000FF, // Blue
+	0x00FFFF, // Cyan
+	0xFF00FF, // Magenta
+	0xFFFF00, // Yellow
+	0xFFA500, // Orange
+	0x32bb32, //0x32CD32, // Lime Green
+	0x800080, // Purple
+	0xFFDAB9, // Light Peach
+	0x000080, // Navy Blue
+	0xaaaaaa // Transparent //FIXME should this be in this QVColors array?
+);
+
+let intToColorString = function(int){
+	let s = int.toString(16);
+	if(s.length > 6) s = s.substring(s.length-6);
+	while(s.length < 6) s = '0'+s;
+	return '#'+s;
+};
+
+//throw new Error('TODO make a smaller sparse vector for the vecs im editing, thats not optimized for sparse 256 megapixels, is optimized for the same sparse space but much fewer pixels that a user paints. Use a simple {}? thats inefficient cuz converts to string.');
+
+var paintColorIndex = 2; //0 to 13. Index in QVColors. 14 is transparent. 15 is fork.
+var makeButtonsToChooseColorToPaint = function(){
+	let div = document.createElement('div');
+	div.style.padding = '10px';
+	for(let i=0; i<QVColors.length; i++){
+		let button = document.createElement('button');
+		let c = intToColorString(QVColors[i]);;
+		button.style.backgroundColor = c;
+		button.innerHTML = ((i==TRANSPARENT) ? 'TRANSPARENT' : c);
+		if(i==TRANSPARENT) button.style.opacity = .27;
+		button.onclick = function(){
+			paintColorIndex = i;
+			div.style.backgroundColor = this.style.backgroundColor;
+		};
+		div.appendChild(button);
+		if(i==3 || i==7 || i==11) div.appendChild(document.createElement('br'));
+	}
+	document.body.appendChild(div);
+};
+
+
+//y and x range 0 (inclusive) to 1 (exclusive) as this is a recursive square of unlimited resolution.
+//This might be called from a 3d view similar to mariokart on SNES or a 2d view similar to dagball,
+//for example, depending on if 3d vs 2d affine transform. This should be copied directly into video memory
+//of a html5 canvas though you might need to reverse endian of the 4 bytes or something.
+//
+//This does not update color. That is a more expensive calculation that sums 14 numbers log times then picks 1 of the 4 childs
+//of parent at each of log levels to copy its colorInt from that child, so can approximate the color at lower detail
+//or maybe if some of the QuadtreeVoxels are removed leaving only such parent?
+QuadtreeVoxel.prototype.colorIntAtYX = function(y,x){
+	if(this.childs){
+		if(y < .5){ //top
+			if(x < .5){ //top left
+				return this.childs[0].colorIntAtYX(y*2,x*2);
+			}else{ //top right
+				return this.childs[1].colorIntAtYX(y*2,(x-.5)*2);
+			}
+		}else{ //bottom
+			if(x < .5){ //bottom left
+				return this.childs[2].colorIntAtYX((y-.5)*2,x*2);
+			}else{ //bottom right
+				return this.childs[3].colorIntAtYX((y-.5)*2,(x-.5)*2);
+			}
+		}
+	}else{
+		return this.colorInt;
+	}
+};
+
+var newUint4Array = function(size){
+	return new Uint4Array(new Uint8Array((size+1)>>1), 0, size);
+};
+
+var Uint4Array = function(bytes, hexOffset, hexLength){
+	this.bytes = bytes;
+	this.offset = hexOffset;
+	this.length = hexLength;
+}
+
+Uint4Array.prototype.get = function(index){
+	let i = index-this.offset;
+	if(i&1){ //odd hexIndex, low 4 bits
+		return this.bytes[i>>1]&0xf;
+	}else{ //even hexIndex, high 4 bits
+		return this.bytes[i>>1]>>4;
+	}
+};
+
+Uint4Array.prototype.set = function(index, value){
+	let i = index-this.offset;
+	let byteIndex = i>>1;
+	if(i&1){ //odd hexIndex, low 4 bits
+		this.bytes[byteIndex] = (this.bytes[byteIndex]&0xf0) | value;
+	}else{ //even hexIndex, high 4 bits
+		this.bytes[byteIndex] = (value<<4) | (this.bytes[byteIndex]&0xf);
+	}
+};
+
+Uint4Array.prototype.backingArray = function(from, toExcl){
+	if(from == 0 && toExcl == this.length){
+		return this;
+	}else{
+		return new Uint4Array(this.bytes, this.offset+from, toExcl-from);
+	}
+};
+
+//concat the uint4 based sparse pics (that QuadtreeVoxel is the js object form of sum of uint4s)
+var concatUint4Arrays = function(...args){
+	let totalLength = 0;
+	for(let a of args){
+		totalLength += a.length;
+	}
+	let ret = newUint4Array(totalLength);
+	let size = 0;
+	for(let arr of args){
+		for(let i=0; i<arr.length; i++){
+			ret[size++] = arr[i];
+		}
+	}
+	return ret;
+};
+
+
+
+//start optional_recurseColorSums as new Float64Array(14), which it does automatically if you dont give that param.
+//Its added into recursively, then subtracted from after pop.
+//The 14 sums (1 per color) along a path (of log number of QuadtreeVoxels) to a leaf are summed,
+//and whichever of those is biggest at a leaf is that leaf's 1 of 14 colors.
+//Popping back upward, parent copies a colorInt from 1 of its childs, maybe choose a child randomly or maybe always child 0?
+QuadtreeVoxel.prototype.updateAllColorInts = function(optional_recurseColorSums){
+	let recurseColorSums = optional_recurseColorSums || new Float64Array(COLORS);
+	if(this.colorSums.length != recurseColorSums.length){
+		throw new Error('diff sizes');
+	}
+	addInto(this.colorSums, recurseColorSums);
+	try{
+		if(this.childs){
+			for(let ch of this.childs){
+				ch.updateAllColorInts(recurseColorSums);
+			}
+			let copyColorFromWhichChildIndex = randInt(4); //FIXME always use 0 vs random?
+			this.colorInt = this.childs[copyColorFromWhichChildIndex].colorInt;
+		}else{
+			this.colorInt = QVColors[indexOfMaxPreferLow(recurseColorSums)];
+		}
+	}finally{
+		subInto(this.colorSums, recurseColorSums);
+	}
+};
+
+//The sparse form is a byte array with 2 uint4s per byte, used as a sequence of uint4s. voxIndex is in units of 4 bits, not bytes.
+//If the uint4 == FORK then theres 4 childs.
+QuadtreeVoxel.prototype.addSparsePic = function(bytes, voxIndex){
+
+};
+
+
+
+var FullScreenCanvas = function(parentDom, optionalHeight, optionalWidth){
+	if(!parentDom) parentDom = document.body;
+	this.dom = document.createElement('canvas');
+	//TODO z order, in front of everything else.
+	//this.dom = document.getElementById('canv'); //FIXME remove this line, use createElement instead.
+	this.context = null;
+	this.imageData = null;
+	this.pixels = null;
+	this.byteRect = null;
+	parentDom.appendChild(this.dom);
+	this.dom.style.position = 'absolute';
+	this.dom.style.left = '0px';
+	this.dom.style.top = '0px';
+	
+	this.resizeCanvas = function(optionalHeight, optionalWidth){
+		if(this.dom.width != window.innerWidth) this.dom.width = optionalWidth || window.innerWidth;
+		if(this.dom.height != window.innerHeight) this.dom.height = optionalHeight || window.innerHeight;
+	}
+	
+	//TODO optimize, if you're not reading from the canvas, maybe can skip parts of this or only call this once?
+	this.beforePaint = function(){
+		if(this.dom == null) throw 'No canvas';
+		this.context = this.dom.getContext('2d');
+		//console.log('this.dom.width = '+this.dom.width);
+		this.imageData = this.context.getImageData(0, 0, this.dom.width, this.dom.height);
+		this.pixels = this.imageData.data;
+		this.byteRect = new ByteRect(this.pixels, this.dom.height, this.dom.width);
+	};
+	
+	//call this after modify byteRect.bytes which contains pixel colors to write to Canvas.
+	this.afterPaint = function(){
+		if(this.dom == null) throw 'No canvas';
+		//this.context.drawImage(this.dom, 0, 0, this.dom.width, this.dom.height);
+		this.context.putImageData(this.imageData, 0, 0);
+	};
+	
+	this.removeFromScreen = function(){
+		this.dom.remove();
+		this.dom = null;
+		this.context = null;
+		this.imageData = null;
+		this.pixels = null;
+		this.byteRect = null;
+	};
+	
+	this.resizeCanvas(optionalHeight, optionalWidth);
+	this.beforePaint();
+};
+
+//readable and writable pixels as Uint8Array. A canvas is a kind of Uint8Array.
+//Single pixel read and write funcs are slow unless you just do a few places.
+//TODO Write horizontal lines of same color or 2 colors on end interpolating between,
+//and these lines can be derived from triangle which has different color at each corner.
+var ByteRect = function(bytes, height, width){
+	this.bytes = bytes;
+	this.height = height;
+	this.width = width;
+};
+
+//TODO choose [y x] vs [x y z scale] order. Swap y and x in ByteRect params order? aftrans is [x y z scale].
+
+ByteRect.prototype.index = function(y, x, colorDim){
+	return (y*this.width+x)*4+colorDim;
+};
+
+ByteRect.prototype.read = function(y, x, colorDim){
+	return this.bytes[(y*this.width+x)*4+colorDim];
+};
+
+var between = (min,val,max)=>Math.max(min,Math.min(val,max));
+
+ByteRect.prototype.readSafe = function(y, x, colorDim){
+	return this.bytes[between(0,(y*this.width+x)*4+colorDim,this.bytes.length-1)];
+};
+
+
+ByteRect.prototype.write = function(y, x, colorDim, bright){
+	this.bytes[(y*this.width+x)*4+colorDim] = bright;
+};
+
+ByteRect.prototype.writeSafe = function(y, x, colorDim, bright){
+	this.bytes[between(0,(y*this.width+x)*4+colorDim,this.bytes.length-1)] = bright;
+};
+
+ByteRect.prototype.writeSafeRGBA = function(y, x, redByte, greenByte, blueByte, optionalAlphaByte){
+	if(optionalAlphaByte === undefined) optionalAlphaByte = 255; //visible
+	let index = between(0,(y*this.width+x)*4,this.bytes.length-4);
+	this.bytes[index+RED] = redByte;
+	this.bytes[index+GREEN] = greenByte;
+	this.bytes[index+BLUE] = blueByte;
+	this.bytes[index+ALPHA] = optionalAlphaByte;
+};
+
+ByteRect.prototype.atYXWriteRGB = function(y, x, redByte, greenByte, blueByte){
+	if(x < 0 || this.width <= x || y < 0 || this.height <= y) return;
+	let ind = (y*this.width+x)*4;
+	this.bytes[ind+RED] = redByte;
+	this.bytes[ind+GREEN] = greenByte;
+	this.bytes[ind+BLUE] = blueByte;
+};
+
+ByteRect.prototype.writeHoriz = function(y, fromX, toXExclusive, colorDim, fromBright, toBright){
+	var indexStart = this.index(y, fromX, colorDim);
+	var pixelSiz = toXExclusive-fromX;
+	var siz = pixelSiz*4;
+	var bright = fromBright;
+	var brightAdd = (toBright-fromBright)/pixelSiz;
+	for(var i=0; i<siz; i+=4){
+		bright += brightAdd;
+		this.bytes[indexStart+i] = Math.floor(bright) & 0xff;
+	}
+};
+
+ByteRect.prototype.flipHorizontal = function(){
+	let bytes = this.bytes;
+	for(let y=0; y<this.height; y++){
+		let xMid = Math.floor(this.width/2);
+		let offsetA = y*this.width*4; //first byte index of first pixel in row
+		let offsetB = ((y+1)*this.width-1)*4; //first byte of last pixel in row
+		for(let x=0; x<xMid; x++){
+			for(let colorDim=0; colorDim<4; colorDim++){ //swap 2 pixels as 4 bytes each
+				let temp = bytes[offsetA+colorDim];
+				bytes[offsetA+colorDim] = bytes[offsetB+colorDim];
+				bytes[offsetB+colorDim] = temp;
+			}
+			offsetA += 4;
+			offsetB -= 4;
+		}
+	}
+};
+
+ByteRect.prototype.verifySameSizeAs = function(byteRect){
+	if(!byteRect) throw 'Param ByteRect = '+byteRect;
+	if(this.height != byteRect.height) throw this.height+' == this.height != byteRect.height == '+byteRect.height;
+	if(this.width != byteRect.width) throw this.width+' == this.width != byteRect.width == '+byteRect.width;
+};
+
+ByteRect.prototype.paintLineYXYXRGB = function(fromY, fromX, toY, toX, redByte, greenByte, blueByte){
+	let diffY = toY-fromY;
+	let diffX = toX-fromX;
+	let len = Math.hypot(diffY, diffX);
+	let numPoints = Math.ceil(len*1.5);
+	for(let i=0; i<numPoints; i++){
+		//TODO optimize
+		let y = Math.round(fromY+diffY*i/numPoints);
+		let x = Math.round(fromX+diffX*i/numPoints);
+		this.atYXWriteRGB(y, x, redByte, greenByte, blueByte);
+	}
+};
+
+var canv = null;
+
+var endingCanv = false;
+
+/** utc time in seconds */
+var time = function(){
+	return Date.now()*.001;
+};
+
+var timeStarted = 0;
+
+/** get bellcurve height on a chosen bellcurve thats stretched and moved */
+var bell = function(ave, dev, maxHeight, observe){
+	let diff = (observe-ave)/dev;
+	return Math.exp(-diff*diff);
+};
+
+var sigmoid = function(x){
+	return .5+.5*Math.tanh(x);
+};
+
+//0 to 255
+var backgroundRed = 0;
+var backgroundGreen = 0;
+var backgroundBlue = 0;
+
+var screenY = (x,y,z)=>{
+	let mouseYScaled = (mouseY-500)/500;
+	return Math.floor(y+z*mouseYScaled);
+};
+
+var screenX = (x,y,z)=>{
+	let mouseXScaled = (mouseX-500)/500;
+	return Math.floor(x+z*mouseXScaled);
+};
+
+var sigmoid = x=>(1/(1+Math.exp(-x)));
+
+//age in seconds since transition started. Just paints onto ByteRect
+var doGraphicsDtAgeByterect = function(dt, age, byteRect){
+
+	let bytes = byteRect.bytes;
+	let offset = Math.floor(Math.sin(time()*5*2*Math.PI)*100+100);
+	let w = byteRect.width;
+	let h = byteRect.height;
+	let cx = Math.floor(w/2); //center x
+	let cy = Math.floor(h/2); //center y
+	let i = indexOfSelectedVec(); //-1 if none selected
+	//if holding button of a vec but not painting it, display that vec, else display all vecs merged at [0]
+	/*let vec = vecs[(i!=-1 && !mouseButtonA && !mouseButtonB) ? i : 0];
+	for(let i=0; i<bytes.length; i+=4){
+		//let y = (i>>8)&0xff;
+		//let x = i&0xff;
+		let bright = sigmoid(vec[i>>2]*10000)*256;
+		bytes[i+RED] = bright;
+		bytes[i+GREEN] = bright;
+		bytes[i+BLUE] = bright;
+		bytes[i+ALPHA] = 255;
+	}*/
+	for(let i=0; i<bytes.length; i+=4){		
+		//DISPLAY BLOCKS which is a sparse lazyEvaled 128x128 grid of Block objects which is each a 128x128 pixels with 16 doubles per pixel.
+		let pixI = i>>2; //4 bytes each
+		let y = (pixI>>8)&0xff;
+		let x = pixI&0xff;
+		let bigY = Math.max(0, Math.min(viewY+y, 0x3ffff));
+		let bigX = Math.max(0, Math.min(viewX+x, 0x3ffff));
+		let bigAddrOfColor0 = yxcToInt(bigY,bigX,0);
+		//TODO optimize by not computing max again here every time
+		let maxInt54 = -Infinity;
+		let maxColorIndex = 0;
+		for(let c=0; c<COLORS; c++){ //TODO shouldnt be doing this loop every video frame, only when any users vector changes and only on the parts they changed.
+			//TODO optimize by getting Block object. All the colors for the same pixel are certainly in the same Block.
+			//Also can reuse it for some of the same x.
+			let int54Sum = D(bigAddrOfColor0+c);
+			if(int54Sum > maxInt54){
+				maxInt54 = int54Sum;
+				maxColorIndex = c;
+			}
+		}
+		let colorRGB = QVColors[maxColorIndex];
+		bytes[i+RED] = (colorRGB>>16)&0xff;
+		bytes[i+GREEN] = (colorRGB>>8)&0xff;
+		bytes[i+BLUE] = colorRGB&0xff;
+		bytes[i+ALPHA] = 255;
+		/*
+		//let y = (i>>8)&0xff;
+		//let x = i&0xff;
+		let bright = sigmoid(vec[i>>2]*10000)*256;
+		bytes[i+RED] = bright;
+		bytes[i+GREEN] = bright;
+		bytes[i+BLUE] = bright;
+		bytes[i+ALPHA] = 255;
+		*/
+	}
+	/*for(let i=0; i<bytes.length; i+=4){
+		bytes[i+RED] = backgroundRed;
+		bytes[i+GREEN] = backgroundGreen;
+		bytes[i+BLUE] = backgroundBlue;
+		bytes[i+ALPHA] = 255;
+	}
+	let i = 0;
+	for(let y=0; y<h; y++){
+		for(let x=0; x<w; x++){
+			bytes[i+RED] = (x+age*35)&255;
+			bytes[i+GREEN] = (x+y*age)&255;
+			bytes[i+BLUE] = (333*x/y)&255;
+			i += 4;
+		}
+		i += w*4; //row of pixels
+	}
+	
+	for(let v=0; v<voxs; v++){
+		let r = 30+5*Math.sin(age*2.3);
+		let a = v*.01;
+		//voxelsX[v] = 200+v*.3;//Math.sin(a)*r;
+		voxelsX[v] = 600+3*Math.sin(a)*r;
+		voxelsY[v] = 400+41*Math.sin(v*v*.00000321);
+		//voxelsZ[v] = 44*Math.sin(v*.0001);//200+Math.cos(a)*r;
+		voxelsZ[v] = 544*Math.sin(v*.0001+v*v*.0000001);//200+Math.cos(a)*r;
+	}
+	
+	for(let v=0; v<voxs; v++){
+		let y = screenY(voxelsX[v],voxelsY[v],voxelsZ[v]);
+		let x = screenX(voxelsX[v],voxelsY[v],voxelsZ[v]);
+		let red = 255;
+		let green = 255;
+		let blue = 255;
+		byteRect.writeSafeRGBA(y,x,red,green,blue);
+	}
+	*/
+};
+
+var lastTimeOf_doGraphicsDtAgeByterectAndMore = 0;
+
+let voxs = 10000;
+var voxelsX = new Float32Array(voxs);
+var voxelsY = new Float32Array(voxs);
+var voxelsZ = new Float32Array(voxs);
+
+let mouseY = 0;
+let mouseX = 0;
+
+//let vecs = [new Float32Array(0x10000)];
+//for(let i=0; i<30; i++){
+//	//TODO make 1<<16 size vec, append to vecs.
+//}
+
+let vecs = []; //slow user vecs, each a {} whose key is int (as in yxcToInt) and value is float64.
+
+//call this on v from 1 to vecs.length-1, but not on 0 cuz thats the main game area where the other vecs are summed.
+//This keeps it that way except roundoff. cuz of roundoff you need to rebuild vecs[0] from the others every minute or so.
+var vecPlusEq = function(v, i, add){
+	vecs[v][i] += add;
+	vecs[0][i] += add;
+};
+
+//-1 if none, else returns index in vecs. never returns 0 cuz thats the main game area that is sum of all the other vecs.
+//ignores if multiple buttons are held. only uses first one it finds.
+var indexOfSelectedVec = function(){
+	for(let buttonName in keysDown){
+		if(keysDown[buttonName]){
+			return keyToWhichVec[buttonName];
+		}
+	}
+	return -1;
+};
+
+var vecMultEq = function(v, i, mult){
+	let oldVal = vecs[v][i];
+	let newVal = vecs[v][i]*mult;
+	vecPlusEq(v, i, newVal-oldVal);
+};
+
+var keysDown = {};
+
+var keyToWhichVec = {};
+
+var makeVecExistForKey = function(buttonName){
+	if(keyToWhichVec[buttonName] === undefined){
+		keyToWhichVec[buttonName] = vecs.length;
+		//vecs.push(newRandomVec());
+		vecs.push({}); //{} of int (as in yxcToInt) to float64. FIXME or value should be true (and use sizeToPixelMultiplier for all the vals)?
+		addInto(vecs[vecs.length-1], vecs[0]);
+	}
+};
+
+var mapSize = function(map){
+	let count = 0;
+	for(let key in map){
+		count++;
+	}
+	return count;
+};
+
+const maxInt = 0x7fffffff;
+
+//this is used for 1/sqrt(size) but as int so theres no roundoff in float64 when up to 2 million (4 million etc?) vecs are added.
+var sizeToPixelMultiplier = size=>Math.floor(maxInt/Math.sqrt(size));
+
+//add how much per pixel, as an int.
+var mapMultiplier = function(map){
+	return sizeToPixelMultiplier(mapSize(map))
+};
+
+//throw new Error('FIXME or should the {} be a map of int to uint4 color? instead of true or float64');
+
+//param is a {} of int (as in yxcToInt) to float64, like those in the var 'vecs'. FIXME or value should be true (and use sizeToPixelMultiplier for all the vals)?
+var mapLenWithRoundoff = function(map){
+	let sumOfSquares = 0;
+	for(let key in map){
+		let num = map[key];
+		sumOfSquares += num*num; //FIXME this could overflow int but since its a double it will work with roundoff
+	}
+	return Math.sqrt(sumOfSquares);
+};
+
+
+var Len = function(vec){
+	let sum = 0;
+	for(let i=0; i<vec.length; i++){
+		sum += vec[i]*vec[i];
+	}
+	return Math.sqrt(sum);
+};
+
+var setLen = function(vec,newLen){
+	let len = Len(vec);
+	if(len){
+		let mul = newLen/len;
+		for(let i=0; i<vec.length; i++){
+			vec[i] *= mul;
+		}
+	}else{
+		fillVec(vec,1/Math.sqrt(vec.length));
+	}
+};
+
+var randInt = function(max){
+	return Math.floor(Math.random()*max);
+};
+
+//FIXME use randBell. theres a func for it in dagball. but hypercube random is ok for early tests.
+var newRandomVec = function(){
+	let vec = new Float32Array(1<<16);
+	for(let i=0; i<vec.length; i++){
+		vec[i] = Math.random()*2-1;
+	}
+	setLen(vec,1);
+	return vec;
+};
+
+var fillVec = function(vec,val){
+	for(let i=0; i<vec.length; i++){
+		vec[i] = val;
+	}
+};
+
+var indexOfMaxPreferLow = function(arr){ //in ties, lower index wins
+	let max = arr[0];
+	let maxi = 0;
+	for(let i=1; i<arr.length; i++){
+		if(arr[i] > max){
+			max = arr[i];
+			maxi = i;
+		}
+	}
+	return maxi;
+};
+
+//2 vecs
+var addInto = function(read,write){
+	if(read.length != write.length) throw new Error('diff sizes');
+	for(let i=0; i<read.length; i++){
+		write[i] += read[i];
+	}
+};
+
+//2 vecs
+var subInto = function(read,write){
+	if(read.length != write.length) throw new Error('diff sizes');
+	for(let i=0; i<read.length; i++){
+		write[i] -= read[i];
+	}
+};
+
+var addMulInto = function(read,mul,write){
+	if(read.length != write.length) throw new Error('diff sizes');
+	for(let i=0; i<read.length; i++){
+		write[i] += mul*read[i];
+		if(isNaN(write[i])){
+			throw new Error('NaN');
+		}
+	}
+};
+
+var clearVec = function(vec){
+	fillVec(vec,0);
+};
+
+/*
+var rebuild = function(){
+	/*clearVec(vecs[0]);
+	for(let v=1; v<vecs.length; v++){
+		for(let i=0; i<0x10000; i++){
+			vecs[0][i] += vecs[v][i];
+		}
+	}*
+	rebuildRange(0,0x10000);
+};
+
+var rebuildRange = function(fromIndex, toIndexExcl){
+	for(let i=fromIndex; i<toIndexExcl; i++){
+		vecs[0][i] = 0;
+	}
+	for(let v=1; v<vecs.length; v++){
+		for(let i=fromIndex; i<toIndexExcl; i++){
+			vecs[0][i] += vecs[v][i];
+		}
+	}
+};*/
+
+/*
+//display this.vecs[0] in canvas
+dagplace.FloatGame.prototype.display = function(){
+	throw new Error('TODO');
+};
+
+//dagplace.FloatGame.prototype.onUIEvent = function(canvasY, canvasX, button, val){
+//};
+*/
+
+var copyVec = function(vec){
+	return new Float32Array(vec);
+};
+
+var mouseButtonA = false;
+var mouseButtonB = false;
+
+let rebuildNextRow = 0;
+
+var moveCanvasDown = 250;
+
+//map is {} of int (like from yxcToInt but the c is always 0) to uint4 color. That uint4 is the c. If transparent or fork, its not in the map.
+var addVecByIntMulplier = function(map, intMultiplier){
+	for(let key in map){
+		let color = map[key]; //uint4. is not TRANSPARENT or FORK.
+		//TODO optimize by using something faster than ints as keys in {}/map so dont have to parseInt it.
+		let intInBigSparsePicSpace = parseInt(key)|color; //parseInt(key) has the y and x but c of 0.
+		DPlusEq(intInBigSparsePicSpace, intMultiplier);
+	}
+};
+
+var subtractVecVFromBigSparsePic = function(v){
+	let map = vecs[v];
+	let intMultiplier = mapMultiplier(map);
+	addVecByIntMulplier(map, -intMultiplier);
+};
+
+var addVecVFromBigSparsePic = function(v){
+	let map = vecs[v];
+	let intMultiplier = mapMultiplier(map);
+	addVecByIntMulplier(map, intMultiplier);
+};
+
+//0 for 1 pixel. 3 for -3 -2 -1 0 1 2 3 so 7 pixels wide, etc.
+//var paintRadiusInteger = 0;
+var paintRadiusInteger = 5;
+
+var doGraphicsDtAgeByterectAndMore = function(){
+	
+	//fix roundoff in 1 row (size 256) of pixels, 1 such row per video frame, so every 256 video frames it does them all.
+	//rebuildRange(rebuildNextRow<<8, (rebuildNextRow+1)<<8);
+
+	rebuildNextRow = (rebuildNextRow+1)&0xff;
+	if(canv == null){
+		canv = new FullScreenCanvas(null,256,256);
+		canv.dom.style.top = moveCanvasDown+'px';
+		canv.dom.addEventListener('mousedown', event=>{
+			//console.log('mousedown');
+			if(event.button == 0) mouseButtonA = true;
+			if(event.button == 2) mouseButtonB = true;
+		});
+		canv.dom.addEventListener('mouseup', event=>{
+			//console.log('mouseup');
+			if(event.button == 0) mouseButtonA = false;
+			if(event.button == 2) mouseButtonB = false;
+		});
+		canv.dom.addEventListener('mousemove', event=>{
+			//console.log('mousemove');
+			mouseY = event.clientY-moveCanvasDown;
+			mouseX = event.clientX;
+			let v = indexOfSelectedVec(); //-1 if none selected
+			//console.log('v='+v);
+
+			//paintColorIndex is set by clicking 1 of the 14 (or 15 if count transparent) colored buttons to choose what color to paint,
+			//or transparent button to erase.
+			let color = mouseButtonA ? paintColorIndex : (mouseButtonB ? TRANSPARENT : -1);
+			let intInBigSparsePicSpace = yxcToInt(viewY+mouseY, viewX+mouseX, 0); //this is of color 0. it goes up to color15/fork.
+			let willChangeUsersVec = v!=-1 && (mouseButtonA || mouseButtonB);
+			if(willChangeUsersVec){
+				subtractVecVFromBigSparsePic(v);
+				if(paintRadiusInteger){
+					if(paintRadiusInteger < 0 || Math.floor(paintRadiusInteger) != paintRadiusInteger || paintRadiusInteger > 100){
+						throw new Error('paintRadiusInteger='+paintRadiusInteger);
+					}
+					let r = paintRadiusInteger;
+					let rr = r*r;
+					let centerY = viewY+mouseY;
+					let centerX = viewX+mouseX;
+					for(let y=centerY-r; y<=centerY+r; y++){
+						if(0 <= y && y < 0x4000) for(let x=centerX-r; x<=centerX+r; x++){
+							if(0 <= x && x < 0x4000){
+								let dy = centerY-y;
+								let dx = centerX-x;
+								let lenSq = dy*dy+dx*dx;
+								if(lenSq <= rr){
+									//color 0 cuz thats key in vecs[any][yxcOfCBeing0]==colorUint4.
+									//TODO use Int32Array and append ints to it since each int can be a 2d voxel.
+									let i = yxcToInt(y, x, 0);
+									if(color == TRANSPARENT){
+										delete vecs[v][i];
+									}else if(color < TRANSPARENT){ //is not FORK
+										vecs[v][i] = color;
+										console.log('Set vec['+v+']['+i+']='+color+' y='+y+' x='+x+'i='+i);
+									}
+								}
+							}
+						}
+					}
+				}else{
+					if(color == TRANSPARENT){
+						delete vecs[v][intInBigSparsePicSpace];
+					}else if(color < TRANSPARENT){ //is not FORK
+						vecs[v][intInBigSparsePicSpace] = color;
+					}
+				}
+				addVecVFromBigSparsePic(v);
+			}
+
+			
+			//throw new Error('TODO make colors work here');
+			/*
+			let i = mouseY*canv.byteRect.width+mouseX;
+			//let addHowMuch = .01;
+			let much = .01;
+			let addHowMuch = mouseButtonA ? much : (mouseButtonB ? -much : 0);
+			if(addHowMuch && v != -1 && 0 <= i && i < 0x10000){
+				//vecPlusEq(v, i, addHowMuch); //mods vec[0] and vec[v]
+				let r = 5;
+				let rr = r*r;
+				for(let y=mouseY-r; y<=mouseY+r; y++){
+					if(0 <= y && y < 0x100) for(let x=mouseX-r; x<=mouseX+r; x++){
+						if(0 <= x && x < 0x100){
+							let dy = mouseY-y;
+							let dx = mouseX-x;
+							let lenSq = dy*dy+dx*dx;
+							if(lenSq <= rr){
+								let i = (y<<8)|x;
+								//if(0 <= i && i < 0x10000){
+									vecPlusEq(v, i, addHowMuch); //mods vec[0] and vec[v]
+								//}
+							}
+						}
+					}
+				}
+				addMulInto(vecs[v], -1, vecs[0]); //mods vec[0]
+				setLen(vecs[v],1);
+				addMulInto(vecs[v], 1, vecs[0]); //mods vec[0]
+			}
+			*/
+			//console.log('mouseButtonA='+mouseButtonA+' mouseButtonB='+mouseButtonB+' addHowMuch='+addHowMuch);
+		});
+		//make canvas selectable for key events
+		canv.dom.setAttribute('tabindex', '0');
+		canv.dom.addEventListener('keydown', event=>{
+			//console.log('keydown '+event.key);
+			keysDown[event.key] = true;
+			makeVecExistForKey(event.key);
+		});
+		canv.dom.addEventListener('keyup', event=>{
+			//console.log('keyup '+event.key);
+			keysDown[event.key] = false;
+			makeVecExistForKey(event.key);
+		});
+	}
+	let now = time();
+	let age = now-timeStarted; //how many seconds ago did this page transition start?
+	let dt = Math.max(0, Math.min(now-lastTimeOf_doGraphicsDtAgeByterectAndMore, .2));
+	lastTimeOf_doGraphicsDtAgeByterectAndMore = now;
+	canv.beforePaint();
+	doGraphicsDtAgeByterect(dt, age, canv.byteRect);
+	canv.afterPaint();
+	setTimeout(doGraphicsDtAgeByterectAndMore, 1);
+};
+
+
+window.onload = ()=>{
+	timeStarted = time();
+	doGraphicsDtAgeByterectAndMore();
+	makeButtonsToChooseColorToPaint();
+};
+
+console.log('Display as sortedpointers. also make an option for rule110 convfield. have canvas save to jpg and have a current jpg that users can download so they download it in a loop or something');
+
+
+</script>
+</head><body>
+	<h6>DagPlace prototype of 16384x16384 sparse pic editable by many vectors/players at once similar to but not made by r/place.<br>
+	viewY=<input type="number" step="4" min="0" max="16128" oninput="viewY = this.valueAsNumber;" value="8192">
+	viewX=<input type="number" step="4" min="0" max="16128" oninput="viewX = this.valueAsNumber;" value="8192"><br>
+	view size is 256x256 (and 16 float64s (used as int54) per pixel to count 4 bit color).
+	Click a color button then hold any keyboard button (to choose which vector you're editing) and hold left mouse button while moving mouse to paint that, or hold that same keyboard button and right mouse button to erase/transparent.<br>
+	
+	Im building, going for 256 million elections, each with continuous voting, between a few million users/players. Each pixel is an election between 14 possible colors. You can vote with strength 1/sqrt(numPixelsYouVotedOn) on as many pixels as you want, change your votes any time.
+
+	Similar to and not made by r/place. Massively multiplayer opensource peer to peer. Paint as many pixels as u want, change them at low lag, have 1/sqrt(numPixelsPainted) influence per pixel. 4 bit color. Each 4 bits chooses 1 of 14 colors transparent or 2x2 fork recursively. Fills a sparse tensor[infinity][infinity][14]. Color is max of [14] int54s
+	</h6>
+</body></html>
